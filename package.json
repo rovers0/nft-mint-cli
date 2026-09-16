@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "mint": "tsx src/cli.ts",
+    "mint:preset": "tsx src/mint-preset.ts",
+    "gas:estimate": "tsx src/tools/gas-preestimate.ts",
     "build": "tsc",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit"

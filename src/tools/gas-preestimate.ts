@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+
 /*
  * ============================================================
  * NFT MINT GAS PRE-ESTIMATE TOOL
@@ -389,6 +392,191 @@ async function estimateGasAcrossRpc(
   }
 
   return successful;
+}
+
+
+/*
+ * ============================================================
+ * SAFE HISTORICAL FALLBACK
+ * ============================================================
+ *
+ * If OpenSea /mint returns 422 because THIS wallet is not
+ * eligible for the active phase, we must NOT build/sign/broadcast
+ * a transaction for this wallet.
+ *
+ * Instead, optionally estimate from historical successful mint
+ * transactions supplied in:
+ *
+ *   <projectRoot>/gas-reference.json
+ *
+ * Example:
+ * {
+ *   "robominttest": {
+ *     "transactions": [
+ *       {
+ *         "hash": "0x...",
+ *         "gasUsed": 86225
+ *       }
+ *     ]
+ *   }
+ * }
+ *
+ * If only hashes are supplied, the tool fetches the receipt from
+ * each configured RPC and uses gasUsed as a historical reference.
+ *
+ * This fallback NEVER signs or broadcasts anything.
+ * It does NOT claim that historical gasUsed is an exact estimate.
+ * ============================================================
+ */
+
+interface HistoricalReference {
+  hash?: string;
+  gasUsed?: number | string;
+}
+
+interface HistoricalConfig {
+  [slug: string]: {
+    transactions?: HistoricalReference[];
+  };
+}
+
+interface HistoricalGasResult {
+  hash: string;
+  gasUsed: bigint;
+  rpcUrl: string;
+}
+
+const HISTORICAL_CONFIG_NAME = "gas-reference.json";
+
+function loadHistoricalReferences(slug: string): HistoricalReference[] {
+  const filePath = path.join(process.cwd(), HISTORICAL_CONFIG_NAME);
+
+  try {
+    if (!existsSync(filePath)) {
+      return [];
+    }
+
+    const raw = readFileSync(filePath, "utf8");
+    const config = JSON.parse(raw) as HistoricalConfig;
+    return config[slug]?.transactions ?? [];
+  } catch (error) {
+    console.log(
+      `[FALLBACK] Could not read ${HISTORICAL_CONFIG_NAME}: ${errorMessage(error)}`,
+    );
+    return [];
+  }
+}
+
+function normalizeTxHash(value: string): `0x${string}` {
+  if (!/^0x[a-fA-F0-9]{64}$/.test(value)) {
+    throw new Error(`Invalid transaction hash: ${value}`);
+  }
+
+  return value as `0x${string}`;
+}
+
+async function estimateHistoricalGas(
+  clients: PublicClient[],
+  rpcUrls: string[],
+  references: HistoricalReference[],
+): Promise<HistoricalGasResult[]> {
+  const results: HistoricalGasResult[] = [];
+
+  for (const reference of references) {
+    try {
+      let suppliedGas: bigint | undefined;
+
+      if (reference.gasUsed !== undefined) {
+        const value = BigInt(reference.gasUsed);
+
+        if (value > 0n) {
+          suppliedGas = value;
+        }
+      }
+
+      if (reference.hash) {
+        const hash = normalizeTxHash(reference.hash);
+
+        const attempts = await Promise.allSettled(
+          clients.map(async (client, index) => {
+            const receipt = await client.getTransactionReceipt({
+              hash,
+            });
+
+            if (receipt.status !== "success") {
+              throw new Error(
+                `transaction status is ${receipt.status}`,
+              );
+            }
+
+            return {
+              hash,
+              gasUsed: receipt.gasUsed,
+              rpcUrl: rpcUrls[index],
+            } satisfies HistoricalGasResult;
+          }),
+        );
+
+        for (const attempt of attempts) {
+          if (attempt.status === "fulfilled") {
+            results.push(attempt.value);
+            break;
+          }
+        }
+
+        if (results.some((item) => item.hash === hash)) {
+          continue;
+        }
+      }
+
+      if (suppliedGas !== undefined) {
+        results.push({
+          hash: reference.hash ?? "manual-reference",
+          gasUsed: suppliedGas,
+          rpcUrl: "gas-reference.json",
+        });
+      }
+    } catch (error) {
+      console.log(
+        `[FALLBACK] Reference failed: ${errorMessage(error)}`,
+      );
+    }
+  }
+
+  return results;
+}
+
+function calculateHistoricalRecommendation(
+  results: HistoricalGasResult[],
+  safetyPercent: number,
+  roundTo: bigint,
+): {
+  maxGas: bigint;
+  averageGas: bigint;
+  recommendedGas: bigint;
+} {
+  let maxGas = 0n;
+  let totalGas = 0n;
+
+  for (const result of results) {
+    if (result.gasUsed > maxGas) {
+      maxGas = result.gasUsed;
+    }
+
+    totalGas += result.gasUsed;
+  }
+
+  const averageGas = totalGas / BigInt(results.length);
+  const recommendedGas = roundUp(
+    applySafetyMargin(maxGas, safetyPercent),
+    roundTo,
+  );
+
+  return {
+    maxGas,
+    averageGas,
+    recommendedGas,
+  };
 }
 
 /*
@@ -815,25 +1003,118 @@ async function main(): Promise<void> {
 
   if (!mintTx) {
     console.log("");
-
+    console.log("[RESULT] No valid mint calldata for this wallet.");
     console.log(
-      "[RESULT] Could not build a valid mint transaction.",
+      "[SAFE] This wallet is NOT eligible for the active phase.",
+    );
+    console.log(
+      "[SAFE] No mint calldata will be signed or broadcast.",
     );
 
-    console.log(
-      "[RESULT] Gas cannot be estimated because there is no " +
-        "valid mint calldata.",
-    );
+    /*
+     * ----------------------------------------------------------
+     * HISTORICAL FALLBACK
+     * ----------------------------------------------------------
+     *
+     * This path is ONLY for gas planning.
+     *
+     * It deliberately does not create a transaction object for
+     * the current wallet and never calls a wallet/signer.
+     * ----------------------------------------------------------
+     */
+
+    const references = loadHistoricalReferences(options.slug);
+
+    if (references.length === 0) {
+      console.log("");
+      console.log(
+        "[FALLBACK] No historical references found.",
+      );
+      console.log(
+        `[FALLBACK] Optional file: ${HISTORICAL_CONFIG_NAME}`,
+      );
+      console.log(
+        '[FALLBACK] Example: {"robominttest":{"transactions":[{"hash":"0x..."}]}}',
+      );
+      console.log("");
+      console.log("[SAFE] No transaction signed.");
+      console.log("[SAFE] No transaction broadcast.");
+      return;
+    }
 
     console.log("");
-
     console.log(
-      "[SAFE] No transaction signed.",
+      `[FALLBACK] Found ${references.length} historical reference(s).`,
+    );
+    console.log(
+      "[FALLBACK] Reading successful transaction receipts...",
     );
 
-    console.log(
-      "[SAFE] No transaction broadcast.",
+    const historical = await estimateHistoricalGas(
+      clients,
+      allRpcUrls,
+      references,
     );
+
+    if (historical.length === 0) {
+      console.log(
+        "[FALLBACK] Could not obtain any successful historical gas reference.",
+      );
+      console.log("[SAFE] No transaction signed.");
+      console.log("[SAFE] No transaction broadcast.");
+      return;
+    }
+
+    const historicalRecommendation =
+      calculateHistoricalRecommendation(
+        historical,
+        safetyPercent,
+        roundTo,
+      );
+
+    console.log("");
+    console.log("========================================");
+    console.log("       HISTORICAL GAS FALLBACK");
+    console.log("========================================");
+
+    for (const result of historical) {
+      console.log(
+        `Reference gasUsed : ${result.gasUsed} ` +
+          `@ ${result.rpcUrl}`,
+      );
+      console.log(
+        `Reference TX      : ${result.hash}`,
+      );
+    }
+
+    console.log(
+      `Highest gasUsed   : ${historicalRecommendation.maxGas}`,
+    );
+    console.log(
+      `Average gasUsed   : ${historicalRecommendation.averageGas}`,
+    );
+    console.log(
+      `Safety margin     : +${safetyPercent}%`,
+    );
+    console.log(
+      `Recommended limit : ${historicalRecommendation.recommendedGas}`,
+    );
+
+    console.log("========================================");
+    console.log("");
+    console.log(
+      "[WARNING] Historical gasUsed is NOT an exact estimate",
+    );
+    console.log(
+      "[WARNING] for this wallet or the future mint phase.",
+    );
+    console.log(
+      "[WARNING] Use it only as a conservative planning value.",
+    );
+    console.log("");
+    console.log("[SAFE] No transaction signed.");
+    console.log("[SAFE] No transaction broadcast.");
+    console.log("");
 
     return;
   }
@@ -1051,6 +1332,11 @@ Usage:
     [--safety <percent>] \\
     [--round <gas>]
 
+Fallback:
+  If OpenSea /mint returns 422 for the current wallet, the tool
+  never signs/broadcasts. It may use optional historical references
+  from ./gas-reference.json to calculate a conservative gas limit.
+
 Required:
 
   --slug       OpenSea drop/collection slug
@@ -1091,6 +1377,17 @@ Custom rounding:
     --chain-id 4663 \\
     --wallet 0x0CbA5D0cd0c6a7e8581A4e57684B069a8C024F16 \\
     --round 10000
+
+Fallback file example (project root):
+
+  {
+    "robominttest": {
+      "transactions": [
+        { "hash": "0xYOUR_SUCCESSFUL_MINT_TX_HASH" },
+        { "gasUsed": 86225 }
+      ]
+    }
+  }
 
 Safety:
 
